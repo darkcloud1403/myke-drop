@@ -32,8 +32,8 @@ DROP_USER = os.environ.get("DROP_USER", "admin")
 DROP_PASS = os.environ.get("DROP_PASS", "admin123")
 PORT = int(os.environ.get("PORT", 8000))
 
-# Cryptographic token signing: survives all server restarts, expires on browser close
-AUTH_SECRET = hashlib.sha256(f"{DROP_USER}:{DROP_PASS}:drop_salt_v3".encode()).hexdigest()
+# Cryptographic token signing: survives all server restarts, valid across entire session
+AUTH_SECRET = hashlib.sha256(f"{DROP_USER}:{DROP_PASS}:drop_salt_v4".encode()).hexdigest()
 
 def make_session_token(user):
     sig = hmac.new(AUTH_SECRET.encode(), user.encode(), hashlib.sha256).hexdigest()
@@ -163,6 +163,7 @@ class GoogleDriveStorage:
         self.folders_cache = {} # name -> id
         self.folders_list_cache = None
         self.folders_list_time = 0
+        self.notes_cache = {} # file_id -> text
         self.ensure_folder("General")
 
     def test_connection(self):
@@ -184,7 +185,7 @@ class GoogleDriveStorage:
             meta = {'name': f, 'mimeType': 'application/vnd.google-apps.folder', 'parents': [self.root_id]}
             created = self.service.files().create(body=meta, fields='id, name').execute()
             self.folders_cache[f] = created["id"]
-            self.folders_list_cache = None # invalidate cache
+            self.folders_list_cache = None
             return created["id"]
         return None
 
@@ -192,7 +193,6 @@ class GoogleDriveStorage:
         return self.get_folder_id(name, create=True)
 
     def list_folders(self):
-        # Cache folders list for 20 seconds to prevent rate-limiting and lag
         now = time.time()
         if self.folders_list_cache is not None and (now - self.folders_list_time < 20):
             return self.folders_list_cache
@@ -236,20 +236,25 @@ class GoogleDriveStorage:
                 mtime = time.time()
             it = {"name": fname, "size": size, "time": mtime, "id": f["id"]}
             if fname.startswith("note-") and fname.endswith(".txt"):
-                try:
-                    desc = f.get("description")
-                    if desc:
-                        it["text"] = desc
-                    else:
-                        req = self.service.files().get_media(fileId=f["id"])
-                        fh = io.BytesIO()
-                        dl = MediaIoBaseDownload(fh, req)
-                        done = False
-                        while not done: _, done = dl.next_chunk()
-                        fh.seek(0)
-                        it["text"] = fh.read().decode("utf8", errors="replace")
-                except Exception:
-                    it["text"] = ""
+                if f["id"] in self.notes_cache:
+                    it["text"] = self.notes_cache[f["id"]]
+                else:
+                    try:
+                        desc = f.get("description")
+                        if desc:
+                            text = desc
+                        else:
+                            req = self.service.files().get_media(fileId=f["id"])
+                            fh = io.BytesIO()
+                            dl = MediaIoBaseDownload(fh, req)
+                            done = False
+                            while not done: _, done = dl.next_chunk()
+                            fh.seek(0)
+                            text = fh.read().decode("utf8", errors="replace")
+                        self.notes_cache[f["id"]] = text
+                        it["text"] = text
+                    except Exception:
+                        it["text"] = ""
             items.append(it)
         return sorted(items, key=lambda x: x["time"])
 
@@ -289,7 +294,9 @@ class GoogleDriveStorage:
         text = body.decode("utf8", errors="replace")
         media = MediaIoBaseUpload(io.BytesIO(body), mimetype="text/plain", resumable=False)
         meta = {'name': fname, 'parents': [fid], 'description': text}
-        self.service.files().create(body=meta, media_body=media, fields='id').execute()
+        f = self.service.files().create(body=meta, media_body=media, fields='id').execute()
+        if f.get("id"):
+            self.notes_cache[f["id"]] = text
 
     def create_folder(self, name):
         f = safe_name(name)
@@ -306,7 +313,9 @@ class GoogleDriveStorage:
         q = f"'{fid}' in parents and name = '{esc_fname}' and trashed = false"
         res = self.service.files().list(q=q, fields="files(id)").execute()
         for f in res.get("files", []):
-            try: self.service.files().delete(fileId=f["id"]).execute()
+            try:
+                self.service.files().delete(fileId=f["id"]).execute()
+                self.notes_cache.pop(f["id"], None)
             except Exception: pass
 
     def delete_folder(self, folder):
@@ -378,12 +387,12 @@ class H(BaseHTTPRequestHandler):
         auth = self.headers.get("Authorization", "")
         if auth.startswith("Bearer "):
             return auth[7:].strip()
-        cookie_header = self.headers.get("Cookie")
-        if cookie_header:
-            c = cookies.SimpleCookie()
-            c.load(cookie_header)
-            if "session_token" in c:
-                return c["session_token"].value
+        cookie_header = self.headers.get("Cookie", "")
+        if "session_token=" in cookie_header:
+            for part in cookie_header.split(";"):
+                part = part.strip()
+                if part.startswith("session_token="):
+                    return part.split("=", 1)[1].strip()
         return None
 
     def is_authenticated(self):
@@ -453,7 +462,6 @@ class H(BaseHTTPRequestHandler):
                 pwd = data.get("password", "")
                 if secrets.compare_digest(user, DROP_USER) and secrets.compare_digest(pwd, DROP_PASS):
                     token = make_session_token(user)
-                    # Session cookie (no Max-Age/Expires = closes when browser closes)
                     cookie = f"session_token={token}; Path=/; SameSite=Lax; HttpOnly"
                     return self.out({"ok": True, "token": token, "storage": storage.mode}, headers={"Set-Cookie": cookie})
                 return self.out({"error": "Invalid username or password"}, code=401)
@@ -638,7 +646,7 @@ dialog h3{margin-bottom:12px;font-size:17px}
 
 <script>
 const $=s=>document.querySelector(s);
-let cur=localStorage.f||"General",last="",token=sessionStorage.getItem("drop_token")||"";
+let cur=localStorage.f||"General",last="",token=localStorage.getItem("drop_token")||sessionStorage.getItem("drop_token")||"";
 const q=encodeURIComponent;
 
 const api=async(u,o={})=>{
@@ -646,15 +654,26 @@ const api=async(u,o={})=>{
  if(token)o.headers["Authorization"]="Bearer "+token;
  try{
   const r=await fetch(u,o);
-  if(r.status===401){showAuth(true);return null}
-  if(!r.ok){const e=await r.json().catch(()=>({}));return{error:e.error||"Request failed"}}
+  if(r.status===401){
+   showAuth(true);
+   return null;
+  }
+  if(!r.ok){
+   const e=await r.json().catch(()=>({}));
+   return {error:e.error||"Request failed"};
+  }
   return r.json().catch(()=>({}));
  }catch(e){
   return {error:e.message};
  }
 };
 
-const post=(u,b)=>api(u,{method:"POST",body:typeof b=="string"?b:JSON.stringify(b)});
+const post=(u,b)=>api(u,{
+ method:"POST",
+ headers:typeof b==="string"?{"Content-Type":"text/plain;charset=utf-8"}:{"Content-Type":"application/json"},
+ body:typeof b==="string"?b:JSON.stringify(b)
+});
+
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const sz=n=>n>1e6?(n/1e6).toFixed(1)+" MB":Math.ceil(n/1e3)+" KB";
 const tm=t=>new Date(t*1000).toLocaleString([],{day:"numeric",month:"short",hour:"2-digit",minute:"2-digit"});
@@ -684,6 +703,7 @@ $("#auth-form").onsubmit=async e=>{
  const j=await res.json().catch(()=>({}));
  if(res.ok&&j.ok&&j.token){
   token=j.token;
+  localStorage.setItem("drop_token",token);
   sessionStorage.setItem("drop_token",token);
   $("#auth-err").style.display="none";
   showAuth(false);
@@ -698,6 +718,7 @@ $("#auth-form").onsubmit=async e=>{
 $("#logout").onclick=async()=>{
  await fetch("/api/logout",{method:"POST",headers:token?{"Authorization":"Bearer "+token}:{}});
  token="";
+ localStorage.removeItem("drop_token");
  sessionStorage.removeItem("drop_token");
  showAuth(true);
 };
@@ -721,7 +742,7 @@ async function folders(){
 async function items(force){
  const it=await api("/api/items?f="+q(cur));
  if(!it)return;
- if(it.error){toast("Error loading folder: "+it.error);return}
+ if(it.error){toast("Error: "+it.error);return}
  const s=JSON.stringify(it);
  if(s==last&&!force)return;last=s;
  const fd=$("#feed"),near=fd.scrollHeight-fd.scrollTop-fd.clientHeight<140;
@@ -751,10 +772,19 @@ async function up(files){
 }
 
 async function send(){
- const t=$("#in").value.trim();if(!t)return;
- $("#in").value="";$("#in").style.height="";
+ const inEl=$("#in");
+ const t=inEl.value.trim();
+ if(!t)return;
+ inEl.value="";
+ inEl.style.height="";
+ toast("Sending note…");
  const r=await post("/api/note?f="+q(cur),t);
- if(r&&r.error){toast("Failed to send note: "+r.error);return}
+ if(r&&r.error){
+  toast("Failed to send: "+r.error);
+  inEl.value=t;
+  return;
+ }
+ toast("Note sent!");
  refresh(true);
 }
 
