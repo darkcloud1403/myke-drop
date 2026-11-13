@@ -1,4 +1,4 @@
-import os, sys, json, time, shutil, socket, mimetypes, io, secrets
+import os, sys, json, time, shutil, socket, mimetypes, io, secrets, hashlib, hmac
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, unquote
 from http import cookies
@@ -32,11 +32,28 @@ DROP_USER = os.environ.get("DROP_USER", "admin")
 DROP_PASS = os.environ.get("DROP_PASS", "admin123")
 PORT = int(os.environ.get("PORT", 8000))
 
-# Active sessions: token -> expiry_timestamp
-SESSIONS = {}
+# Cryptographic token signing: survives all server restarts, expires on browser close
+AUTH_SECRET = hashlib.sha256(f"{DROP_USER}:{DROP_PASS}:drop_salt_v3".encode()).hexdigest()
+
+def make_session_token(user):
+    sig = hmac.new(AUTH_SECRET.encode(), user.encode(), hashlib.sha256).hexdigest()
+    return f"{user}:{sig}"
+
+def verify_session_token(token):
+    if not token or ":" not in token:
+        return False
+    parts = token.split(":", 1)
+    if len(parts) != 2:
+        return False
+    user, sig = parts
+    expected_sig = hmac.new(AUTH_SECRET.encode(), user.encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(sig, expected_sig) and hmac.compare_digest(user, DROP_USER)
 
 def safe_name(n):
     return os.path.basename(n).strip().lstrip(".").replace("/", "").replace("\\", "")
+
+def gdrive_escape(s):
+    return s.replace("\\", "\\\\").replace("'", "\\'")
 
 # ----------------- STORAGE: LOCAL -----------------
 class LocalStorage:
@@ -141,9 +158,11 @@ class GoogleDriveStorage:
 
     def __init__(self, creds, root_folder_id):
         self.creds = creds
-        self.root_id = root_folder_id
+        self.root_id = root_folder_id.strip()
         self.service = build('drive', 'v3', credentials=creds, cache_discovery=False)
-        self.folders_cache = {}
+        self.folders_cache = {} # name -> id
+        self.folders_list_cache = None
+        self.folders_list_time = 0
         self.ensure_folder("General")
 
     def test_connection(self):
@@ -154,7 +173,8 @@ class GoogleDriveStorage:
         f = safe_name(name) or "General"
         if f in self.folders_cache:
             return self.folders_cache[f]
-        q = f"'{self.root_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and name = '{f}' and trashed = false"
+        esc_f = gdrive_escape(f)
+        q = f"'{self.root_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and name = '{esc_f}' and trashed = false"
         res = self.service.files().list(q=q, fields="files(id, name)").execute()
         files = res.get("files", [])
         if files:
@@ -162,8 +182,9 @@ class GoogleDriveStorage:
             return files[0]["id"]
         if create:
             meta = {'name': f, 'mimeType': 'application/vnd.google-apps.folder', 'parents': [self.root_id]}
-            created = self.service.files().create(body=meta, fields='id').execute()
+            created = self.service.files().create(body=meta, fields='id, name').execute()
             self.folders_cache[f] = created["id"]
+            self.folders_list_cache = None # invalidate cache
             return created["id"]
         return None
 
@@ -171,6 +192,11 @@ class GoogleDriveStorage:
         return self.get_folder_id(name, create=True)
 
     def list_folders(self):
+        # Cache folders list for 20 seconds to prevent rate-limiting and lag
+        now = time.time()
+        if self.folders_list_cache is not None and (now - self.folders_list_time < 20):
+            return self.folders_list_cache
+
         q = f"'{self.root_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
         res = self.service.files().list(q=q, fields="files(id, name)").execute()
         raw_folders = res.get("files", [])
@@ -181,16 +207,16 @@ class GoogleDriveStorage:
             fid = rf["id"]; fname = rf["name"]
             self.folders_cache[fname] = fid
             if fname == "General": found_gen = True
-            # Count items inside
-            iq = f"'{fid}' in parents and mimeType != 'application/vnd.google-apps.folder' and trashed = false"
-            ires = self.service.files().list(q=iq, fields="files(id)").execute()
-            count = len(ires.get("files", []))
-            result.append({"name": fname, "count": count})
+            result.append({"name": fname, "count": 0})
             
         if not found_gen:
-            gid = self.ensure_folder("General")
+            self.ensure_folder("General")
             result.insert(0, {"name": "General", "count": 0})
-        return sorted(result, key=lambda x: (x["name"] != "General", x["name"]))
+            
+        sorted_folders = sorted(result, key=lambda x: (x["name"] != "General", x["name"]))
+        self.folders_list_cache = sorted_folders
+        self.folders_list_time = now
+        return sorted_folders
 
     def list_items(self, folder):
         fid = self.get_folder_id(folder, create=False)
@@ -201,7 +227,6 @@ class GoogleDriveStorage:
         for f in res.get("files", []):
             fname = f["name"]
             size = int(f.get("size", 0))
-            # Parse createdTime ISO format to timestamp
             try:
                 t_str = f.get("createdTime", "").replace("Z", "+00:00")
                 import datetime
@@ -211,7 +236,6 @@ class GoogleDriveStorage:
                 mtime = time.time()
             it = {"name": fname, "size": size, "time": mtime, "id": f["id"]}
             if fname.startswith("note-") and fname.endswith(".txt"):
-                # Retrieve short note content
                 try:
                     desc = f.get("description")
                     if desc:
@@ -233,7 +257,8 @@ class GoogleDriveStorage:
         fid = self.get_folder_id(folder, create=False)
         if not fid: return None, None, 0
         fname = safe_name(name)
-        q = f"'{fid}' in parents and name = '{fname}' and trashed = false"
+        esc_fname = gdrive_escape(fname)
+        q = f"'{fid}' in parents and name = '{esc_fname}' and trashed = false"
         res = self.service.files().list(q=q, fields="files(id, name, size, mimeType)").execute()
         files = res.get("files", [])
         if not files: return None, None, 0
@@ -270,13 +295,15 @@ class GoogleDriveStorage:
         f = safe_name(name)
         if not f: return False
         self.ensure_folder(f)
+        self.folders_list_cache = None
         return True
 
     def delete_item(self, folder, name):
         fid = self.get_folder_id(folder, create=False)
         if not fid: return
         fname = safe_name(name)
-        q = f"'{fid}' in parents and name = '{fname}' and trashed = false"
+        esc_fname = gdrive_escape(fname)
+        q = f"'{fid}' in parents and name = '{esc_fname}' and trashed = false"
         res = self.service.files().list(q=q, fields="files(id)").execute()
         for f in res.get("files", []):
             try: self.service.files().delete(fileId=f["id"]).execute()
@@ -290,6 +317,7 @@ class GoogleDriveStorage:
             try:
                 self.service.files().delete(fileId=fid).execute()
                 self.folders_cache.pop(f, None)
+                self.folders_list_cache = None
             except Exception: pass
 
     def move_item(self, name, from_folder, to_folder):
@@ -297,7 +325,8 @@ class GoogleDriveStorage:
         to_fid = self.ensure_folder(to_folder)
         if not from_fid or not to_fid: return
         fname = safe_name(name)
-        q = f"'{from_fid}' in parents and name = '{fname}' and trashed = false"
+        esc_fname = gdrive_escape(fname)
+        q = f"'{from_fid}' in parents and name = '{esc_fname}' and trashed = false"
         res = self.service.files().list(q=q, fields="files(id)").execute()
         if res.get("files"):
             file_id = res["files"][0]["id"]
@@ -359,13 +388,7 @@ class H(BaseHTTPRequestHandler):
 
     def is_authenticated(self):
         token = self.get_auth_token()
-        if not token: return False
-        exp = SESSIONS.get(token)
-        if exp and exp > time.time():
-            return True
-        if token in SESSIONS:
-            del SESSIONS[token]
-        return False
+        return verify_session_token(token)
 
     def do_GET(self):
         u = urlparse(self.path); p = u.path
@@ -429,18 +452,16 @@ class H(BaseHTTPRequestHandler):
                 user = data.get("username", "")
                 pwd = data.get("password", "")
                 if secrets.compare_digest(user, DROP_USER) and secrets.compare_digest(pwd, DROP_PASS):
-                    token = secrets.token_hex(24)
-                    SESSIONS[token] = time.time() + (30 * 86400) # 30 days
-                    cookie = f"session_token={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000"
+                    token = make_session_token(user)
+                    # Session cookie (no Max-Age/Expires = closes when browser closes)
+                    cookie = f"session_token={token}; Path=/; SameSite=Lax; HttpOnly"
                     return self.out({"ok": True, "token": token, "storage": storage.mode}, headers={"Set-Cookie": cookie})
                 return self.out({"error": "Invalid username or password"}, code=401)
             except Exception as e:
                 return self.out({"error": str(e)}, code=400)
 
         if p == "/api/logout":
-            token = self.get_auth_token()
-            if token in SESSIONS: del SESSIONS[token]
-            cookie = "session_token=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
+            cookie = "session_token=; Path=/; SameSite=Lax; HttpOnly; Max-Age=0"
             return self.out({"ok": True}, headers={"Set-Cookie": cookie})
 
         # Require authentication for remaining POST endpoints
@@ -526,9 +547,15 @@ header button{padding:6px 8px;border-radius:8px;color:var(--mu)}header button:ho
 .rb{flex:none;width:42px;height:42px;border-radius:50%;display:grid;place-items:center}
 #at{color:var(--mu)}#at:hover{background:var(--card)}#sd{background:var(--ac);color:#fff}
 svg{width:22px;height:22px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
-#toast{position:fixed;left:50%;bottom:80px;transform:translateX(-50%);background:#14202b;color:#fff;padding:8px 16px;border-radius:20px;font-size:13px;display:none;z-index:99}
-dialog{margin:auto;border:0;border-radius:16px;padding:16px;width:min(320px,90vw);background:var(--side);color:var(--tx)}
-dialog::backdrop{background:rgba(0,0,0,.5)}dialog h3{margin-bottom:8px;font-size:16px}
+#toast{position:fixed;left:50%;bottom:80px;transform:translateX(-50%);background:#14202b;color:#fff;padding:8px 16px;border-radius:20px;font-size:13px;display:none;z-index:999}
+dialog{margin:auto;border:0;border-radius:16px;padding:20px;width:min(340px,92vw);background:var(--side);color:var(--tx);box-shadow:0 12px 36px rgba(0,0,0,.25)}
+dialog::backdrop{background:rgba(0,0,0,.5);backdrop-filter:blur(2px)}
+dialog h3{margin-bottom:12px;font-size:17px}
+.dlg-inp{width:100%;padding:10px 12px;border-radius:10px;border:1px solid var(--ln);background:var(--bg);color:var(--tx);font-size:15px;margin-bottom:16px;outline:0}
+.dlg-btns{display:flex;gap:10px;justify-content:flex-end}
+.dlg-btn{padding:8px 16px;border-radius:8px;font-weight:600}
+.dlg-btn.primary{background:var(--ac);color:#fff}
+.dlg-btn.danger{background:var(--danger);color:#fff}
 .drag #feed{outline:2px dashed var(--ac);outline-offset:-8px}
 /* Auth View */
 #auth-view{display:none;position:fixed;inset:0;background:var(--bg);z-index:100;align-items:center;justify-content:center;padding:20px}
@@ -577,23 +604,68 @@ dialog::backdrop{background:rgba(0,0,0,.5)}dialog h3{margin-bottom:8px;font-size
   <button class="rb" id="sd" title="Send"><svg viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></svg></button>
  </div>
 </main>
+
 <div id="toast"></div>
-<dialog id="dlg"><h3>Move to folder</h3><div id="dl"></div></dialog>
+
+<!-- New Folder Dialog -->
+<dialog id="new-folder-dlg">
+ <h3>New Folder</h3>
+ <input class="dlg-inp" id="new-folder-inp" type="text" placeholder="Folder name">
+ <div class="dlg-btns">
+  <button class="dlg-btn" id="nfd-cancel">Cancel</button>
+  <button class="dlg-btn primary" id="nfd-create">Create</button>
+ </div>
+</dialog>
+
+<!-- Delete Folder Confirmation Dialog -->
+<dialog id="del-folder-dlg">
+ <h3>Delete Folder?</h3>
+ <p id="del-folder-msg" style="margin-bottom:16px;color:var(--mu);font-size:14px">Delete this folder and everything inside?</p>
+ <div class="dlg-btns">
+  <button class="dlg-btn" id="dfd-cancel">Cancel</button>
+  <button class="dlg-btn danger" id="dfd-confirm">Delete</button>
+ </div>
+</dialog>
+
+<!-- Move Item Dialog -->
+<dialog id="dlg">
+ <h3>Move to folder</h3>
+ <div id="dl"></div>
+ <div class="dlg-btns" style="margin-top:12px">
+  <button class="dlg-btn" onclick="$('#dlg').close()">Cancel</button>
+ </div>
+</dialog>
+
 <script>
 const $=s=>document.querySelector(s);
-let cur=localStorage.f||"General",last="";
+let cur=localStorage.f||"General",last="",token=sessionStorage.getItem("drop_token")||"";
 const q=encodeURIComponent;
+
 const api=async(u,o={})=>{
- const r=await fetch(u,o);
- if(r.status===401){showAuth(true);return null}
- return r.json().catch(()=>({}));
+ o.headers=o.headers||{};
+ if(token)o.headers["Authorization"]="Bearer "+token;
+ try{
+  const r=await fetch(u,o);
+  if(r.status===401){showAuth(true);return null}
+  if(!r.ok){const e=await r.json().catch(()=>({}));return{error:e.error||"Request failed"}}
+  return r.json().catch(()=>({}));
+ }catch(e){
+  return {error:e.message};
+ }
 };
+
 const post=(u,b)=>api(u,{method:"POST",body:typeof b=="string"?b:JSON.stringify(b)});
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const sz=n=>n>1e6?(n/1e6).toFixed(1)+" MB":Math.ceil(n/1e3)+" KB";
 const tm=t=>new Date(t*1000).toLocaleString([],{day:"numeric",month:"short",hour:"2-digit",minute:"2-digit"});
 const url=n=>`/files/${q(cur)}/${q(n)}`;
-const toast=t=>{$("#toast").textContent=t;$("#toast").style.display=t?"block":"none"};
+const toast=t=>{
+ const el=$("#toast");
+ el.textContent=t;
+ el.style.display=t?"block":"none";
+ if(t)setTimeout(()=>{if(el.textContent===t)el.style.display="none"},4000);
+};
+
 let fs=[];
 
 function showAuth(v){
@@ -604,9 +676,15 @@ function showAuth(v){
 $("#auth-form").onsubmit=async e=>{
  e.preventDefault();
  const u=$("#l-user").value.trim(),p=$("#l-pwd").value;
- const res=await fetch("/api/login",{method:"POST",body:JSON.stringify({username:u,password:p})});
+ const res=await fetch("/api/login",{
+  method:"POST",
+  headers:{"Content-Type":"application/json"},
+  body:JSON.stringify({username:u,password:p})
+ });
  const j=await res.json().catch(()=>({}));
- if(res.ok&&j.ok){
+ if(res.ok&&j.ok&&j.token){
+  token=j.token;
+  sessionStorage.setItem("drop_token",token);
   $("#auth-err").style.display="none";
   showAuth(false);
   updateBadge(j.storage);
@@ -618,7 +696,9 @@ $("#auth-form").onsubmit=async e=>{
 };
 
 $("#logout").onclick=async()=>{
- await fetch("/api/logout",{method:"POST"});
+ await fetch("/api/logout",{method:"POST",headers:token?{"Authorization":"Bearer "+token}:{}});
+ token="";
+ sessionStorage.removeItem("drop_token");
  showAuth(true);
 };
 
@@ -629,20 +709,23 @@ function updateBadge(mode){
 }
 
 async function folders(){
- fs=await api("/api/folders");
- if(!fs)return;
+ const res=await api("/api/folders");
+ if(!res||res.error)return;
+ fs=Array.isArray(res)?res:[];
  if(!fs.find(f=>f.name==cur))cur="General";
- $("#fl").innerHTML=fs.map(f=>`<button class="f ${f.name==cur?"on":""}" data-f="${esc(f.name)}"><span>${esc(f.name)}</span><small>${f.count}</small></button>`).join("");
- $("#title").textContent=cur;$("#df").style.display=cur=="General"?"none":"";
+ $("#fl").innerHTML=fs.map(f=>`<button class="f ${f.name==cur?"on":""}" data-f="${esc(f.name)}"><span>${esc(f.name)}</span></button>`).join("");
+ $("#title").textContent=cur;
+ $("#df").style.display=cur=="General"?"none":"";
 }
 
 async function items(force){
  const it=await api("/api/items?f="+q(cur));
  if(!it)return;
+ if(it.error){toast("Error loading folder: "+it.error);return}
  const s=JSON.stringify(it);
  if(s==last&&!force)return;last=s;
  const fd=$("#feed"),near=fd.scrollHeight-fd.scrollTop-fd.clientHeight<140;
- fd.innerHTML=it.length?it.map(x=>{
+ fd.innerHTML=Array.isArray(it)&&it.length?it.map(x=>{
   const n=x.name,ext=n.split(".").pop().toLowerCase();let b;
   if(x.text!=null)b=`<div class="t">${esc(x.text)}</div>`;
   else if(/^(jpe?g|png|gif|webp|bmp|avif)$/.test(ext))b=`<a href="${url(n)}" target="_blank"><img loading="lazy" src="${url(n)}"></a>`;
@@ -658,50 +741,124 @@ const go=f=>{cur=f;localStorage.f=f;last="";document.body.classList.remove("open
 async function up(files){
  for(const f of files){
   toast("Uploading "+f.name+"…");
-  const r=await fetch(`/api/upload?f=${q(cur)}&name=${q(f.name)}`,{method:"POST",body:f});
+  const headers=token?{"Authorization":"Bearer "+token}:{};
+  const r=await fetch(`/api/upload?f=${q(cur)}&name=${q(f.name)}`,{method:"POST",headers,body:f});
   if(r.status===401){showAuth(true);return}
+  if(!r.ok){toast("Upload failed for "+f.name);return}
  }
- toast("");refresh(true);
+ toast("Uploaded successfully!");
+ refresh(true);
 }
+
 async function send(){
  const t=$("#in").value.trim();if(!t)return;
  $("#in").value="";$("#in").style.height="";
- await post("/api/note?f="+q(cur),t);refresh(true);
+ const r=await post("/api/note?f="+q(cur),t);
+ if(r&&r.error){toast("Failed to send note: "+r.error);return}
+ refresh(true);
 }
 
+// Folder list selection
 $("#fl").onclick=e=>{const b=e.target.closest("[data-f]");if(b)go(b.dataset.f)};
-$("#nf").onclick=async()=>{const n=prompt("Folder name");if(n&&n.trim()){await post("/api/folder",n.trim());go(n.trim())}};
-$("#df").onclick=async()=>{if(confirm(`Delete "${cur}" and everything in it?`)){await post("/api/delete",{f:cur});go("General")}};
+
+// New folder dialog
+$("#nf").onclick=()=>{
+ $("#new-folder-inp").value="";
+ $("#new-folder-dlg").showModal();
+ $("#new-folder-inp").focus();
+};
+$("#nfd-cancel").onclick=()=>$("#new-folder-dlg").close();
+$("#nfd-create").onclick=async()=>{
+ const n=$("#new-folder-inp").value.trim();
+ if(n){
+  toast("Creating folder…");
+  const r=await post("/api/folder",n);
+  $("#new-folder-dlg").close();
+  if(r&&!r.error){go(n);toast("")}
+  else{toast("Error creating folder: "+(r.error||""))}
+ }
+};
+
+// Delete folder dialog
+$("#df").onclick=()=>{
+ $("#del-folder-msg").textContent=`Delete "${cur}" and everything inside?`;
+ $("#del-folder-dlg").showModal();
+};
+$("#dfd-cancel").onclick=()=>$("#del-folder-dlg").close();
+$("#dfd-confirm").onclick=async()=>{
+ $("#del-folder-dlg").close();
+ toast("Deleting folder…");
+ await post("/api/delete",{f:cur});
+ toast("");
+ go("General");
+};
+
 $("#menu").onclick=()=>document.body.classList.toggle("open");
 $("#at").onclick=()=>$("#pick").click();
 $("#pick").onchange=e=>{up([...e.target.files]);e.target.value=""};
 $("#sd").onclick=send;
-$("#in").onkeydown=e=>{if(e.key=="Enter"&&!e.shiftKey&&innerWidth>800){e.preventDefault();send()}};
+$("#in").onkeydown=e=>{
+ if(e.key=="Enter"&&!e.shiftKey){
+  e.preventDefault();
+  send();
+ }
+};
 $("#in").oninput=e=>{e.target.style.height="auto";e.target.style.height=e.target.scrollHeight+"px"};
+
 $("#feed").onclick=async e=>{
  const a=e.target.closest("[data-a]");if(!a)return;const n=a.dataset.n;
- if(a.dataset.a=="rm"){if(confirm("Delete this?")){await post("/api/delete",{f:cur,name:n});refresh(true)}}
- else{$("#dl").innerHTML=fs.filter(f=>f.name!=cur).map(f=>`<button class="f" data-t="${esc(f.name)}">${esc(f.name)}</button>`).join("")||"<p class='empty'>Create another folder first.</p>";
-  $("#dlg").dataset.n=n;$("#dlg").showModal()}
+ if(a.dataset.a=="rm"){
+  if(confirm("Delete "+n+"?")){
+   toast("Deleting…");
+   await post("/api/delete",{f:cur,name:n});
+   toast("");
+   refresh(true);
+  }
+ }else{
+  $("#dl").innerHTML=fs.filter(f=>f.name!=cur).map(f=>`<button class="f" data-t="${esc(f.name)}">${esc(f.name)}</button>`).join("")||"<p class='empty'>No other folders exist.</p>";
+  $("#dlg").dataset.n=n;
+  $("#dlg").showModal();
+ }
 };
+
 $("#dlg").onclick=async e=>{
  const b=e.target.closest("[data-t]");
- if(b){await post("/api/move",{f:cur,name:$("#dlg").dataset.n,to:b.dataset.t});$("#dlg").close();refresh(true)}
- else if(e.target==$("#dlg"))$("#dlg").close();
+ if(b){
+  toast("Moving…");
+  await post("/api/move",{f:cur,name:$("#dlg").dataset.n,to:b.dataset.t});
+  $("#dlg").close();
+  toast("");
+  refresh(true);
+ }else if(e.target==$("#dlg"))$("#dlg").close();
 };
+
 document.ondragover=e=>{e.preventDefault();document.body.classList.add("drag")};
 document.ondragleave=e=>{if(!e.relatedTarget)document.body.classList.remove("drag")};
 document.ondrop=e=>{e.preventDefault();document.body.classList.remove("drag");up([...e.dataTransfer.files])};
 document.onpaste=e=>{const f=[...e.clipboardData.files];if(f.length)up(f)};
 
 async function init(){
- const st=await fetch("/api/status").then(r=>r.json()).catch(()=>({}));
+ const headers=token?{"Authorization":"Bearer "+token}:{};
+ const st=await fetch("/api/status",{headers}).then(r=>r.json()).catch(()=>({}));
  updateBadge(st.storage);
- if(!st.authenticated){showAuth(true)}
- else{refresh(true)}
+ if(!st.authenticated){
+  showAuth(true);
+ }else{
+  refresh(true);
+ }
 }
+
 init();
-setInterval(()=>{if($("#auth-view").style.display!=="flex")refresh(false)},3000);
+
+// Fast active items polling every 3s, folders refreshed every 20s
+let pollCount=0;
+setInterval(()=>{
+ if($("#auth-view").style.display!=="flex"){
+  items(false);
+  pollCount++;
+  if(pollCount%7===0)folders();
+ }
+},3000);
 </script></body></html>"""
 
 if __name__ == "__main__":
